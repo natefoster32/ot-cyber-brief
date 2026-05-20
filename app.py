@@ -4,6 +4,7 @@ Deployed at share.streamlit.io. Bryan clicks button → scraper runs → branded
 brief renders in-page. Powered by Banneker Partners.
 """
 
+import re
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -79,6 +80,97 @@ QUERIES = {
         "Ireland NIS2",
     ],
 }
+
+# ---------- News filter ----------
+# Drop marketing/educational content. Keep actual news.
+NON_NEWS_PATTERNS = [
+    r"\bwebinar\b",
+    r"\bwhitepaper\b",
+    r"\bwhite\s+paper\b",
+    r"\b\d+\s+(things|ways|tips|steps|reasons|key|top|best)\b",
+    r"\bmust\s+know\b",
+    r"\bguide\s+to\b",
+    r"\bhow\s+to\b",
+    r"\b(beginner'?s|complete|ultimate|essential|definitive|practical|comprehensive)\s+guide\b",
+    r"\bbest\s+practices\b",
+    r"\bchecklist\b",
+    r"\bpodcast\b",
+    r"\bep(isode)?\.?\s*\d+\b",
+    r"\bspotlight(?:s|ing)?\b",
+    r"\binterview\b",
+    r"\bq\s*&\s*a\b",
+    r"\bama\b",
+    r"\bsponsored\b",
+    r"\bexplained\b",
+    r"\beverything\s+you\s+(need\s+to\s+)?know\b",
+    r"\bwhat\s+is\b",
+    r"\bcase\s+study\b",
+    r"\bcareer\s+spotlight\b",
+    r"\bopinion:\s*",
+    r"\bcommentary:\s*",
+    r"\bcolumn:\s*",
+]
+
+NEWS_SIGNAL_WORDS = [
+    "breach", "breached", "attack", "attacks", "attacked", "hacked", "hack",
+    "ransomware", "malware", "exploit", "exploited", "zero-day", "zero day",
+    "fined", "fine", "penalty", "settles", "settlement", "indicted", "arrested",
+    "acquires", "acquired", "acquisition", "buys", "merger", "merges",
+    "raises", "raised", "funding", "ipo", "ipos",
+    "launches", "unveils", "announces", "appoints", "names", "hires",
+    "shuts down", "shut down", "halts", "halted", "outage", "disrupts",
+    "warns", "warning", "alert", "advisory", "vulnerability", "cve",
+    "passes", "passed", "enacts", "enacted", "approves", "approved", "directive",
+    "investigation", "probe", "indictment", "lawsuit", "sued",
+    "leaked", "leak", "exposed", "stolen", "theft",
+]
+
+def is_news_story(title: str) -> bool:
+    low = title.lower()
+    for pat in NON_NEWS_PATTERNS:
+        if re.search(pat, low):
+            return False
+    return True
+
+# Theme weights for ranking — breaches/competitive are highest signal for Bryan
+THEME_WEIGHTS = {
+    "Breaches & incidents": 1.00,
+    "Competitive / market": 0.92,
+    "North American regulation (NERC-CIP / TSA / CISA)": 0.72,
+    "EU regulation (NIS2 / CRA / DORA)": 0.68,
+    "OT / ICS cybersecurity": 0.55,
+    "Country-specific (Europe)": 0.50,
+}
+
+LOW_QUALITY_SOURCES = [
+    "openpr", "pr newswire", "businesswire", "globe newswire",
+    "globenewswire", "press release", "marketwatch sponsored",
+    "imdb", "yahoo finance", "the joplin globe",
+]
+
+def news_score(item: dict, theme: str) -> float:
+    score = THEME_WEIGHTS.get(theme, 0.5)
+    days_old = (datetime.now(timezone.utc) - item["published"]).days
+    recency = max(0.0, 1.0 - days_old / 7.0)
+    score *= (0.55 + 0.45 * recency)
+    title_low = item["title"].lower()
+    signal_hits = sum(1 for w in NEWS_SIGNAL_WORDS if w in title_low)
+    score *= (1.0 + 0.15 * min(signal_hits, 4))
+    src = (item.get("source") or "").lower()
+    if any(s in src for s in LOW_QUALITY_SOURCES):
+        score *= 0.4
+    return score
+
+def pick_top_stories(grouped: dict, n: int = 4) -> list[tuple[dict, str]]:
+    scored: list[tuple[dict, str, float]] = []
+    for theme, items in grouped.items():
+        for it in items:
+            if not is_news_story(it["title"]):
+                continue
+            scored.append((it, theme, news_score(it, theme)))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return [(s[0], s[1]) for s in scored[:n]]
+
 
 # Banneker palette
 NAVY = "#181F64"
@@ -387,6 +479,13 @@ if go or st.session_state.get("has_results"):
 
     generated = st.session_state["generated_at"]
 
+    # Apply news filter and re-build ordered, filtered groups using QUERIES order
+    filtered_grouped: dict[str, list[dict]] = {}
+    for theme in QUERIES.keys():
+        items = grouped.get(theme, [])
+        filtered_grouped[theme] = [it for it in items if is_news_story(it["title"])]
+    filtered_total = sum(len(v) for v in filtered_grouped.values())
+
     st.markdown(
         f"""
         <div style='margin-top: 32px; padding: 18px 22px; background: {ICE_BLUE}; border-left: 5px solid {NAVY}; border-radius: 2px;'>
@@ -394,15 +493,46 @@ if go or st.session_state.get("has_results"):
                 {generated.strftime('%B %d, %Y')}
             </div>
             <div style='color: {DARK_GREY}; font-size: 12px; letter-spacing: 0.5px; text-transform: uppercase; font-weight: 600;'>
-                Past {LOOKBACK_DAYS} days &middot; {total} stories &middot; {len(grouped)} themes &middot; Source: Google News RSS
+                Past {LOOKBACK_DAYS} days &middot; {filtered_total} stories &middot; {len(filtered_grouped)} themes &middot; Source: Google News RSS
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+    # "This week's top news" — top 4 ranked stories
+    top_picks = pick_top_stories(filtered_grouped, n=4)
+    if top_picks:
+        rows = []
+        for i, (it, theme) in enumerate(top_picks, start=1):
+            date = it["published"].strftime("%b %d")
+            src = (
+                f"<span style='color: rgba(255,255,255,0.55); font-style: italic; font-size: 12px;'> &mdash; {it['source']}</span>"
+                if it["source"] else ""
+            )
+            theme_short = theme.split(" (")[0]
+            rows.append(
+                f"<div style='margin-bottom: 14px; line-height: 1.5;'>"
+                f"<span style='color: {PERIWINKLE}; font-weight: 800; font-size: 13px; margin-right: 8px;'>{i:02d}</span>"
+                f"<span style='color: rgba(255,255,255,0.55); font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; font-weight: 600; margin-right: 8px;'>{theme_short} &middot; {date}</span><br>"
+                f"<a href='{it['link']}' target='_blank' style='color: #FFFFFF !important; font-size: 15.5px; font-weight: 600; text-decoration: none; border-bottom: 1px dotted rgba(255,255,255,0.4);'>{it['title']}</a>"
+                f"{src}"
+                f"</div>"
+            )
+        st.markdown(
+            f"""
+            <div style='margin-top: 22px; padding: 22px 26px; background: {NAVY}; border-radius: 4px;'>
+                <div style='color: {PERIWINKLE}; font-size: 11px; letter-spacing: 1.8px; text-transform: uppercase; font-weight: 700; margin-bottom: 14px;'>
+                    This week's top news
+                </div>
+                {''.join(rows)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     # Download button
-    docx_bytes = build_docx_bytes(grouped, total)
+    docx_bytes = build_docx_bytes(filtered_grouped, filtered_total)
     st.download_button(
         label="Download as Word doc",
         data=docx_bytes,
@@ -410,8 +540,9 @@ if go or st.session_state.get("has_results"):
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
-    # Themed sections — newspaper feel
-    for i, (theme, items) in enumerate(grouped.items()):
+    # Themed sections — newspaper feel, iterates QUERIES.keys() to enforce order
+    for i, theme in enumerate(QUERIES.keys()):
+        items = filtered_grouped.get(theme, [])
         st.markdown(
             f"""
             <div style='margin: 36px 0 14px 0;'>
@@ -428,7 +559,7 @@ if go or st.session_state.get("has_results"):
         )
         if not items:
             st.markdown(
-                f"<div style='color: {MID_GREY}; font-style: italic; font-size: 13px; margin: 8px 0;'>No coverage in the lookback window.</div>",
+                f"<div style='color: {MID_GREY}; font-style: italic; font-size: 13px; margin: 8px 0;'>No news in the lookback window.</div>",
                 unsafe_allow_html=True,
             )
             continue

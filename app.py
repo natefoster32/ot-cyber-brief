@@ -441,6 +441,19 @@ st.markdown(f"""
   /* Links */
   a {{ color: {NAVY} !important; text-decoration: underline; text-decoration-color: rgba(118, 163, 227, 0.5); }}
   a:hover {{ color: {PERIWINKLE} !important; text-decoration-color: {PERIWINKLE}; }}
+  /* Override link color inside the navy "top news" card so headlines are visible */
+  .top-news-card a,
+  .top-news-card a:link,
+  .top-news-card a:visited {{
+    color: #FFFFFF !important;
+    text-decoration: none !important;
+    border-bottom: 1px dotted rgba(255, 255, 255, 0.45) !important;
+    font-weight: 600 !important;
+  }}
+  .top-news-card a:hover {{
+    color: {PERIWINKLE} !important;
+    border-bottom-color: {PERIWINKLE} !important;
+  }}
   /* Hide Streamlit chrome */
   #MainMenu, footer, header[data-testid="stHeader"] {{ visibility: hidden; }}
 </style>
@@ -514,14 +527,20 @@ if go or st.session_state.get("has_results"):
             rows.append(
                 f"<div style='margin-bottom: 14px; line-height: 1.5;'>"
                 f"<span style='color: {PERIWINKLE}; font-weight: 800; font-size: 13px; margin-right: 8px;'>{i:02d}</span>"
-                f"<span style='color: rgba(255,255,255,0.55); font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; font-weight: 600; margin-right: 8px;'>{theme_short} &middot; {date}</span><br>"
-                f"<a href='{it['link']}' target='_blank' style='color: #FFFFFF !important; font-size: 15.5px; font-weight: 600; text-decoration: none; border-bottom: 1px dotted rgba(255,255,255,0.4);'>{it['title']}</a>"
-                f"{src}"
+                f"<span style='color: rgba(255,255,255,0.6); font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; font-weight: 600; margin-right: 8px;'>{theme_short} &middot; {date}</span><br>"
+                f"<a href='{it['link']}' target='_blank' style='font-size: 15.5px;'>{it['title']}</a>"
+                f"<span style='color: rgba(255,255,255,0.6); font-style: italic; font-size: 12px;'> &mdash; {it['source']}</span>"
+                f"</div>"
+                if it["source"] else
+                f"<div style='margin-bottom: 14px; line-height: 1.5;'>"
+                f"<span style='color: {PERIWINKLE}; font-weight: 800; font-size: 13px; margin-right: 8px;'>{i:02d}</span>"
+                f"<span style='color: rgba(255,255,255,0.6); font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; font-weight: 600; margin-right: 8px;'>{theme_short} &middot; {date}</span><br>"
+                f"<a href='{it['link']}' target='_blank' style='font-size: 15.5px;'>{it['title']}</a>"
                 f"</div>"
             )
         st.markdown(
             f"""
-            <div style='margin-top: 22px; padding: 22px 26px; background: {NAVY}; border-radius: 4px;'>
+            <div class='top-news-card' style='margin-top: 22px; padding: 22px 26px; background: {NAVY}; border-radius: 4px;'>
                 <div style='color: {PERIWINKLE}; font-size: 11px; letter-spacing: 1.8px; text-transform: uppercase; font-weight: 700; margin-bottom: 14px;'>
                     This week's top news
                 </div>

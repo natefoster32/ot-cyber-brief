@@ -4,6 +4,8 @@ Deployed at share.streamlit.io. Bryan clicks button → scraper runs → branded
 brief renders in-page. Powered by Banneker Partners.
 """
 
+import hashlib
+import json
 import re
 import urllib.request
 import urllib.parse
@@ -231,9 +233,16 @@ def fetch_rss(query: str) -> list[dict]:
     return items
 
 
+# Cache key changes whenever QUERIES changes — busts stale cache automatically
+CACHE_VERSION = hashlib.md5(
+    json.dumps(QUERIES, sort_keys=True).encode("utf-8")
+).hexdigest()[:8]
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
-def scrape_all() -> tuple[dict, int]:
-    """Run all queries, dedupe, return (grouped, total). Cached 30 min."""
+def scrape_all(version: str = CACHE_VERSION) -> tuple[dict, int]:
+    """Run all queries, dedupe, return (grouped, total). Cached 30 min.
+    The `version` arg is part of the cache key — bumping it busts the cache."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     grouped: dict[str, list[dict]] = {}
     seen_links: set[str] = set()
@@ -393,6 +402,12 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="collapsed",
 )
+
+# Auto-clear session state when QUERIES (or anything affecting the cache key) changes
+if st.session_state.get("cache_version") != CACHE_VERSION:
+    for _k in list(st.session_state.keys()):
+        del st.session_state[_k]
+    st.session_state["cache_version"] = CACHE_VERSION
 
 st.markdown(f"""
 <style>

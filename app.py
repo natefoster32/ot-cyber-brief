@@ -1,413 +1,45 @@
 """
-OT Cybersecurity Weekly Brief — Streamlit web app
-Deployed at share.streamlit.io. Bryan clicks button → scraper runs → branded
-brief renders in-page. Powered by Banneker Partners.
+Banneker News Tracker — multi-tenant Streamlit app.
+
+Routes (via ?page= and ?id= query params):
+  /                    -> home (landing + list of trackers)
+  /?page=create        -> create a new tracker
+  /?id=<tracker_id>    -> view/run a specific tracker
+  /?id=<id>&edit=1     -> edit an existing tracker
 """
 
-import hashlib
 import json
 import re
-import urllib.request
-import urllib.parse
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
-from io import BytesIO
+import secrets
+from datetime import datetime
 
 import streamlit as st
-from docx import Document
-from docx.shared import Pt, RGBColor, Inches
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
 
-# ---------- Config ----------
+from core import (
+    BODY_GREY,
+    DARK_GREY,
+    DEEP_NAVY,
+    ICE_BLUE,
+    MID_GREY,
+    NAVY,
+    PERIWINKLE,
+    build_docx_bytes,
+    config_hash,
+    pick_top_stories,
+    scrape_for_config,
+)
+from email_sender import send_email
+from storage import delete_config, get_config, load_all_configs, upsert_config
+from templates import TEMPLATES, get_template, get_template_names
 
-LOOKBACK_DAYS = 7
-
-QUERIES = {
-    "Breaches & incidents": [
-        "OT cyberattack",
-        "ICS ransomware",
-        "critical infrastructure breach",
-        "utility cyberattack",
-        "water utility cyberattack",
-        "power grid cyberattack",
-        "oil gas pipeline cyberattack",
-        "manufacturing ransomware shutdown",
-        "factory ransomware",
-        "energy sector breach",
-        "SCADA attack",
-        "industrial ransomware",
-    ],
-    "Competitive / market (M&A, raises)": [
-        "Industrial Defender OT",
-        "Claroty OT security",
-        "Dragos OT cybersecurity",
-        "Nozomi Networks",
-        "Armis OT",
-        "TXOne Networks",
-        "OT cybersecurity acquisition",
-        "OT cybersecurity acquires",
-        "ICS cybersecurity acquisition",
-        "industrial cybersecurity acquired",
-        "OT security funding round",
-        "OT cybersecurity Series funding",
-        "ICS cybersecurity raises",
-        "industrial cybersecurity Series A B C",
-        "OT security startup funding",
-        "operational technology cybersecurity investment",
-    ],
-    "EU regulation (NIS2 / CRA / DORA)": [
-        "NIS2 directive",
-        "Cyber Resilience Act",
-        "DORA cybersecurity",
-        "ENISA OT",
-        "NIS2 enforcement fine",
-    ],
-    "North American regulation (NERC-CIP / TSA / CISA)": [
-        "NERC CIP",
-        "NERC CIP compliance",
-        "NERC CIP audit penalty",
-        "FERC cybersecurity",
-        "TSA pipeline cybersecurity directive",
-        "CISA OT advisory",
-        "CISA critical infrastructure",
-        "EPA water cybersecurity",
-    ],
-    "OT / ICS cybersecurity": [
-        "OT cybersecurity",
-        "ICS cybersecurity",
-        "operational technology security",
-        "SCADA security",
-        "industrial control system security",
-    ],
-    "Country-specific (Europe)": [
-        "Germany cybersecurity regulation OT",
-        "Poland critical infrastructure cybersecurity",
-        "UK NIS regulations",
-        "Italy NIS2",
-        "Austria Cybersicherheit OT",
-        "Switzerland critical infrastructure cybersecurity",
-        "Turkey energy cybersecurity",
-        "Ireland NIS2",
-    ],
-}
-
-# ---------- News filter ----------
-# Drop marketing/educational content. Keep actual news.
-NON_NEWS_PATTERNS = [
-    r"\bwebinar\b",
-    r"\bwhitepaper\b",
-    r"\bwhite\s+paper\b",
-    r"\b\d+\s+(things|ways|tips|steps|reasons|key|top|best)\b",
-    r"\bmust\s+know\b",
-    r"\bguide\s+to\b",
-    r"\bhow\s+to\b",
-    r"\b(beginner'?s|complete|ultimate|essential|definitive|practical|comprehensive)\s+guide\b",
-    r"\bbest\s+practices\b",
-    r"\bchecklist\b",
-    r"\bpodcast\b",
-    r"\bep(isode)?\.?\s*\d+\b",
-    r"\bspotlight(?:s|ing)?\b",
-    r"\binterview\b",
-    r"\bq\s*&\s*a\b",
-    r"\bama\b",
-    r"\bsponsored\b",
-    r"\bexplained\b",
-    r"\beverything\s+you\s+(need\s+to\s+)?know\b",
-    r"\bwhat\s+is\b",
-    r"\bcase\s+study\b",
-    r"\bcareer\s+spotlight\b",
-    r"\bopinion:\s*",
-    r"\bcommentary:\s*",
-    r"\bcolumn:\s*",
-]
-
-NEWS_SIGNAL_WORDS = [
-    "breach", "breached", "attack", "attacks", "attacked", "hacked", "hack",
-    "ransomware", "malware", "exploit", "exploited", "zero-day", "zero day",
-    "fined", "fine", "penalty", "settles", "settlement", "indicted", "arrested",
-    "acquires", "acquired", "acquisition", "buys", "merger", "merges",
-    "raises", "raised", "funding", "ipo", "ipos",
-    "launches", "unveils", "announces", "appoints", "names", "hires",
-    "shuts down", "shut down", "halts", "halted", "outage", "disrupts",
-    "warns", "warning", "alert", "advisory", "vulnerability", "cve",
-    "passes", "passed", "enacts", "enacted", "approves", "approved", "directive",
-    "investigation", "probe", "indictment", "lawsuit", "sued",
-    "leaked", "leak", "exposed", "stolen", "theft",
-]
-
-def is_news_story(title: str) -> bool:
-    low = title.lower()
-    for pat in NON_NEWS_PATTERNS:
-        if re.search(pat, low):
-            return False
-    return True
-
-# Theme weights for ranking — breaches/competitive are highest signal for Bryan
-THEME_WEIGHTS = {
-    "Breaches & incidents": 1.00,
-    "Competitive / market": 0.92,
-    "North American regulation (NERC-CIP / TSA / CISA)": 0.72,
-    "EU regulation (NIS2 / CRA / DORA)": 0.68,
-    "OT / ICS cybersecurity": 0.55,
-    "Country-specific (Europe)": 0.50,
-}
-
-LOW_QUALITY_SOURCES = [
-    "openpr", "pr newswire", "businesswire", "globe newswire",
-    "globenewswire", "press release", "marketwatch sponsored",
-    "imdb", "yahoo finance", "the joplin globe",
-]
-
-def news_score(item: dict, theme: str) -> float:
-    score = THEME_WEIGHTS.get(theme, 0.5)
-    days_old = (datetime.now(timezone.utc) - item["published"]).days
-    recency = max(0.0, 1.0 - days_old / 7.0)
-    score *= (0.55 + 0.45 * recency)
-    title_low = item["title"].lower()
-    signal_hits = sum(1 for w in NEWS_SIGNAL_WORDS if w in title_low)
-    score *= (1.0 + 0.15 * min(signal_hits, 4))
-    src = (item.get("source") or "").lower()
-    if any(s in src for s in LOW_QUALITY_SOURCES):
-        score *= 0.4
-    return score
-
-def pick_top_stories(grouped: dict, n: int = 4) -> list[tuple[dict, str]]:
-    scored: list[tuple[dict, str, float]] = []
-    for theme, items in grouped.items():
-        for it in items:
-            if not is_news_story(it["title"]):
-                continue
-            scored.append((it, theme, news_score(it, theme)))
-    scored.sort(key=lambda x: x[2], reverse=True)
-    return [(s[0], s[1]) for s in scored[:n]]
-
-
-# Banneker palette
-NAVY = "#181F64"
-DEEP_NAVY = "#0D0537"
-DARK_GREY = "#59595B"
-PERIWINKLE = "#76A3E3"
-ICE_BLUE = "#E4EDF9"
-MID_GREY = "#A6A6A6"
-
-# ---------- Scrape ----------
-
-def fetch_rss(query: str) -> list[dict]:
-    url = (
-        "https://news.google.com/rss/search?"
-        f"q={urllib.parse.quote(query)}&hl=en-US&gl=US&ceid=US:en"
-    )
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = r.read()
-    except Exception:
-        return []
-
-    items = []
-    try:
-        root = ET.fromstring(data)
-    except ET.ParseError:
-        return []
-
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub_raw = (item.findtext("pubDate") or "").strip()
-        source_el = item.find("source")
-        source = source_el.text if source_el is not None and source_el.text else ""
-        try:
-            pub = parsedate_to_datetime(pub_raw)
-            if pub.tzinfo is None:
-                pub = pub.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        items.append({
-            "title": title,
-            "link": link,
-            "published": pub,
-            "source": source,
-        })
-    return items
-
-
-# Cache key changes whenever QUERIES changes — busts stale cache automatically
-CACHE_VERSION = hashlib.md5(
-    json.dumps(QUERIES, sort_keys=True).encode("utf-8")
-).hexdigest()[:8]
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def scrape_all(version: str = CACHE_VERSION) -> tuple[dict, int]:
-    """Run all queries, dedupe, return (grouped, total). Cached 30 min.
-    The `version` arg is part of the cache key — bumping it busts the cache."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-    grouped: dict[str, list[dict]] = {}
-    seen_links: set[str] = set()
-    seen_titles: set[str] = set()
-
-    for theme, queries in QUERIES.items():
-        items = []
-        for q in queries:
-            for it in fetch_rss(q):
-                if it["published"] < cutoff:
-                    continue
-                if it["link"] in seen_links:
-                    continue
-                title_key = it["title"].lower()[:120]
-                if title_key in seen_titles:
-                    continue
-                seen_links.add(it["link"])
-                seen_titles.add(title_key)
-                items.append(it)
-        items.sort(key=lambda x: x["published"], reverse=True)
-        grouped[theme] = items
-
-    total = sum(len(v) for v in grouped.values())
-    return grouped, total
-
-
-# ---------- DOCX builder (for download) ----------
-
-def _set_font(rPr, font_name="Inter", size_pt=11, color=None, bold=False, italic=False, underline=False):
-    rFonts = OxmlElement("w:rFonts")
-    rFonts.set(qn("w:ascii"), font_name)
-    rFonts.set(qn("w:hAnsi"), font_name)
-    rPr.append(rFonts)
-    sz = OxmlElement("w:sz")
-    sz.set(qn("w:val"), str(int(size_pt * 2)))
-    rPr.append(sz)
-    if color is not None:
-        c = OxmlElement("w:color")
-        c.set(qn("w:val"), color)
-        rPr.append(c)
-    if bold:
-        rPr.append(OxmlElement("w:b"))
-    if italic:
-        rPr.append(OxmlElement("w:i"))
-    if underline:
-        u = OxmlElement("w:u")
-        u.set(qn("w:val"), "single")
-        rPr.append(u)
-
-
-def _style_run(run, size_pt=11, color_hex="59595B", bold=False, italic=False):
-    run.font.name = "Inter"
-    run.font.size = Pt(size_pt)
-    r, g, b = int(color_hex[0:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)
-    run.font.color.rgb = RGBColor(r, g, b)
-    run.font.bold = bold
-    run.font.italic = italic
-    rPr = run._element.get_or_add_rPr()
-    rFonts = rPr.find(qn("w:rFonts"))
-    if rFonts is None:
-        rFonts = OxmlElement("w:rFonts")
-        rPr.append(rFonts)
-    rFonts.set(qn("w:ascii"), "Inter")
-    rFonts.set(qn("w:hAnsi"), "Inter")
-
-
-def _add_hyperlink(paragraph, url, text, size_pt=11):
-    part = paragraph.part
-    r_id = part.relate_to(
-        url,
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
-        is_external=True,
-    )
-    hyperlink = OxmlElement("w:hyperlink")
-    hyperlink.set(qn("r:id"), r_id)
-    new_run = OxmlElement("w:r")
-    rPr = OxmlElement("w:rPr")
-    _set_font(rPr, size_pt=size_pt, color="181F64", underline=True)
-    new_run.append(rPr)
-    t = OxmlElement("w:t")
-    t.text = text
-    t.set(qn("xml:space"), "preserve")
-    new_run.append(t)
-    hyperlink.append(new_run)
-    paragraph._p.append(hyperlink)
-
-
-def build_docx_bytes(grouped: dict, total: int) -> bytes:
-    doc = Document()
-    normal = doc.styles["Normal"]
-    normal.font.name = "Inter"
-    normal.font.size = Pt(11)
-
-    for section in doc.sections:
-        section.top_margin = Inches(0.7)
-        section.bottom_margin = Inches(1.0)
-        section.left_margin = Inches(0.9)
-        section.right_margin = Inches(0.9)
-        section.footer_distance = Inches(0.4)
-
-    today_pretty = datetime.now().strftime("%B %d, %Y")
-
-    p = doc.add_paragraph()
-    _style_run(p.add_run("OT Cybersecurity Weekly Brief"), size_pt=20, color_hex="181F64", bold=True)
-    p = doc.add_paragraph()
-    _style_run(p.add_run(today_pretty), size_pt=12, color_hex="76A3E3", bold=True)
-    p = doc.add_paragraph()
-    p.paragraph_format.space_after = Pt(10)
-    _style_run(
-        p.add_run(f"Past {LOOKBACK_DAYS} days  |  {total} stories  |  {len(grouped)} themes  |  Source: Google News RSS"),
-        size_pt=9, color_hex="59595B", italic=True,
-    )
-
-    for theme, items in grouped.items():
-        h = doc.add_paragraph()
-        h.paragraph_format.space_before = Pt(14)
-        h.paragraph_format.space_after = Pt(4)
-        _style_run(h.add_run(theme), size_pt=13, color_hex="181F64", bold=True)
-
-        if not items:
-            empty = doc.add_paragraph()
-            _style_run(empty.add_run("No coverage in the lookback window"),
-                       size_pt=10, color_hex="A6A6A6", italic=True)
-            continue
-
-        for it in items:
-            bp = doc.add_paragraph()
-            bp.paragraph_format.left_indent = Inches(0.25)
-            bp.paragraph_format.first_line_indent = Inches(-0.18)
-            bp.paragraph_format.space_after = Pt(2)
-            _style_run(bp.add_run("•  "), size_pt=11, color_hex="181F64", bold=True)
-            _style_run(bp.add_run(it["published"].strftime("%b %d") + "  "),
-                       size_pt=11, color_hex="181F64", bold=True)
-            _add_hyperlink(bp, it["link"], it["title"])
-            if it["source"]:
-                _style_run(bp.add_run(f"  — {it['source']}"),
-                           size_pt=10, color_hex="A6A6A6", italic=True)
-
-    footer = doc.sections[0].footer
-    fp = footer.paragraphs[0]
-    fp.text = ""
-    year = datetime.now().year
-    _style_run(fp.add_run(f"(C) {year} Banneker Partners, LLC. All Rights Reserved. Confidential."),
-               size_pt=8, color_hex="59595B")
-
-    buf = BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-# ---------- UI ----------
+# ---------- Page setup ----------
 
 st.set_page_config(
-    page_title="OT Cyber Weekly Brief — Banneker Partners",
-    page_icon="🛡️",
+    page_title="Banneker News Tracker",
+    page_icon="📰",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
-
-# Auto-clear session state when QUERIES (or anything affecting the cache key) changes
-if st.session_state.get("cache_version") != CACHE_VERSION:
-    for _k in list(st.session_state.keys()):
-        del st.session_state[_k]
-    st.session_state["cache_version"] = CACHE_VERSION
 
 st.markdown(f"""
 <style>
@@ -415,7 +47,6 @@ st.markdown(f"""
   html, body, [class*="css"], [class*="st-"] {{
     font-family: Inter, Calibri, "Segoe UI", Arial, sans-serif !important;
   }}
-  /* Force navy on ALL heading levels and any nested spans Streamlit injects */
   h1, h1 *, h2, h2 *, h3, h3 *,
   [data-testid="stMarkdownContainer"] h1,
   [data-testid="stMarkdownContainer"] h1 *,
@@ -426,20 +57,17 @@ st.markdown(f"""
     color: {NAVY} !important;
     font-weight: 700 !important;
   }}
-  /* Body text — darker for stronger contrast */
-  p, li, div, span, label {{ color: #3A3A3C; }}
-  .block-container {{ padding-top: 2.5rem; padding-bottom: 4rem; max-width: 800px; }}
-  /* Primary CTA */
+  p, li, div, span, label {{ color: {BODY_GREY}; }}
+  .block-container {{ padding-top: 2.5rem; padding-bottom: 4rem; max-width: 820px; }}
   .stButton > button {{
     background-color: {NAVY} !important;
     color: #FFFFFF !important;
     font-weight: 700 !important;
     border: none !important;
-    padding: 16px 36px !important;
+    padding: 14px 32px !important;
     border-radius: 4px !important;
-    font-size: 16px !important;
+    font-size: 15px !important;
     width: 100%;
-    letter-spacing: 0.3px;
     box-shadow: 0 2px 6px rgba(24, 31, 100, 0.18);
     transition: all 0.15s ease;
   }}
@@ -450,7 +78,6 @@ st.markdown(f"""
     transform: translateY(-1px);
   }}
   .stButton > button p {{ color: #FFFFFF !important; font-weight: 700 !important; }}
-  /* Download button */
   .stDownloadButton > button {{
     background-color: #FFFFFF !important;
     color: {NAVY} !important;
@@ -459,14 +86,9 @@ st.markdown(f"""
     padding: 10px 22px !important;
     border-radius: 4px !important;
   }}
-  .stDownloadButton > button:hover {{
-    background-color: {ICE_BLUE} !important;
-  }}
-  .stDownloadButton > button p {{ color: {NAVY} !important; font-weight: 700 !important; }}
-  /* Links */
+  .stDownloadButton > button:hover {{ background-color: {ICE_BLUE} !important; }}
   a {{ color: {NAVY} !important; text-decoration: underline; text-decoration-color: rgba(118, 163, 227, 0.5); }}
   a:hover {{ color: {PERIWINKLE} !important; text-decoration-color: {PERIWINKLE}; }}
-  /* Override link color inside the navy "top news" card so headlines are visible */
   .top-news-card a,
   .top-news-card a:link,
   .top-news-card a:visited {{
@@ -479,158 +101,538 @@ st.markdown(f"""
     color: {PERIWINKLE} !important;
     border-bottom-color: {PERIWINKLE} !important;
   }}
-  /* Hide Streamlit chrome */
   #MainMenu, footer, header[data-testid="stHeader"] {{ visibility: hidden; }}
+  .stTextInput > div > div > input,
+  .stTextArea textarea,
+  .stSelectbox > div > div {{
+    border-radius: 4px !important;
+  }}
 </style>
 """, unsafe_allow_html=True)
 
-# Header (raw HTML to bypass Streamlit's markdown wrappers)
-st.markdown(
-    f"""
-    <div style='border-top: 4px solid {NAVY}; padding-top: 18px; margin-bottom: 8px;'></div>
-    <h1 style='color: {NAVY}; font-weight: 800; font-size: 38px; line-height: 1.1; margin: 0 0 6px 0; letter-spacing: -0.5px;'>
-        OT Cybersecurity Weekly Brief
-    </h1>
-    <div style='color: {PERIWINKLE}; font-weight: 700; font-size: 14px; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 14px;'>
-        Banneker Partners &middot; Industrial Defender Market Intel
-    </div>
-    <div style='color: #3A3A3C; font-size: 15px; line-height: 1.5; margin-bottom: 24px; max-width: 640px;'>
-        Click the button to pull the last 7 days of OT cyber news across breaches, the
-        competitive landscape, EU and NA regulation, and ICS security. Fresh every click.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
-# Button
-go = st.button("Generate this week's brief", type="primary")
+# ---------- Helpers ----------
 
-if go or st.session_state.get("has_results"):
-    if go or "results" not in st.session_state:
-        with st.spinner("Pulling stories from Google News..."):
-            grouped, total = scrape_all()
-        st.session_state["results"] = (grouped, total)
-        st.session_state["has_results"] = True
-        st.session_state["generated_at"] = datetime.now()
-    else:
-        grouped, total = st.session_state["results"]
+def slugify(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s-]", "", s)
+    s = re.sub(r"[\s_-]+", "-", s)
+    s = re.sub(r"^-+|-+$", "", s)
+    return s[:40] or "tracker"
 
-    generated = st.session_state["generated_at"]
 
-    # Apply news filter and re-build ordered, filtered groups using QUERIES order
-    filtered_grouped: dict[str, list[dict]] = {}
-    for theme in QUERIES.keys():
-        items = grouped.get(theme, [])
-        filtered_grouped[theme] = [it for it in items if is_news_story(it["title"])]
-    filtered_total = sum(len(v) for v in filtered_grouped.values())
+def make_tracker_id(name: str) -> str:
+    base = slugify(name)
+    existing = load_all_configs()
+    candidate = base
+    while candidate in existing:
+        candidate = f"{base}-{secrets.token_hex(2)}"
+    return candidate
 
+
+def render_footer():
+    year = datetime.now().year
+    st.markdown(
+        f"<div style='margin-top:56px; padding-top:16px; border-top:1px solid {ICE_BLUE}; color:{MID_GREY}; font-size:11px;'>"
+        f"(C) {year} Banneker Partners, LLC. All Rights Reserved. Confidential."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_masthead(title: str, subtitle: str = ""):
+    sub_html = (
+        f"<div style='color:{PERIWINKLE}; font-weight:700; font-size:13px; letter-spacing:1.5px; text-transform:uppercase; margin-bottom:14px;'>{subtitle}</div>"
+        if subtitle else ""
+    )
     st.markdown(
         f"""
-        <div style='margin-top: 32px; padding: 18px 22px; background: {ICE_BLUE}; border-left: 5px solid {NAVY}; border-radius: 2px;'>
-            <div style='color: {NAVY}; font-weight: 800; font-size: 22px; line-height: 1.1; margin-bottom: 4px;'>
-                {generated.strftime('%B %d, %Y')}
-            </div>
-            <div style='color: {DARK_GREY}; font-size: 12px; letter-spacing: 0.5px; text-transform: uppercase; font-weight: 600;'>
-                Past {LOOKBACK_DAYS} days &middot; {filtered_total} stories &middot; {len(filtered_grouped)} themes &middot; Source: Google News RSS
-            </div>
-        </div>
+        <div style='border-top:4px solid {NAVY}; padding-top:18px; margin-bottom:8px;'></div>
+        <h1 style='color:{NAVY}; font-weight:800; font-size:38px; line-height:1.1; margin:0 0 6px 0; letter-spacing:-0.5px;'>{title}</h1>
+        {sub_html}
         """,
         unsafe_allow_html=True,
     )
 
-    # "This week's top news" — top 4 ranked stories
-    top_picks = pick_top_stories(filtered_grouped, n=4)
-    if top_picks:
-        rows = []
-        for i, (it, theme) in enumerate(top_picks, start=1):
-            date = it["published"].strftime("%b %d")
-            src = (
-                f"<span style='color: rgba(255,255,255,0.55); font-style: italic; font-size: 12px;'> &mdash; {it['source']}</span>"
-                if it["source"] else ""
-            )
-            theme_short = theme.split(" (")[0]
-            rows.append(
-                f"<div style='margin-bottom: 14px; line-height: 1.5;'>"
-                f"<span style='color: {PERIWINKLE}; font-weight: 800; font-size: 13px; margin-right: 8px;'>{i:02d}</span>"
-                f"<span style='color: rgba(255,255,255,0.6); font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; font-weight: 600; margin-right: 8px;'>{theme_short} &middot; {date}</span><br>"
-                f"<a href='{it['link']}' target='_blank' style='font-size: 15.5px;'>{it['title']}</a>"
-                f"<span style='color: rgba(255,255,255,0.6); font-style: italic; font-size: 12px;'> &mdash; {it['source']}</span>"
-                f"</div>"
-                if it["source"] else
-                f"<div style='margin-bottom: 14px; line-height: 1.5;'>"
-                f"<span style='color: {PERIWINKLE}; font-weight: 800; font-size: 13px; margin-right: 8px;'>{i:02d}</span>"
-                f"<span style='color: rgba(255,255,255,0.6); font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; font-weight: 600; margin-right: 8px;'>{theme_short} &middot; {date}</span><br>"
-                f"<a href='{it['link']}' target='_blank' style='font-size: 15.5px;'>{it['title']}</a>"
-                f"</div>"
-            )
-        st.markdown(
-            f"""
-            <div class='top-news-card' style='margin-top: 22px; padding: 22px 26px; background: {NAVY}; border-radius: 4px;'>
-                <div style='color: {PERIWINKLE}; font-size: 11px; letter-spacing: 1.8px; text-transform: uppercase; font-weight: 700; margin-bottom: 14px;'>
-                    This week's top news
-                </div>
-                {''.join(rows)}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
-    # Download button
-    docx_bytes = build_docx_bytes(filtered_grouped, filtered_total)
-    st.download_button(
-        label="Download as Word doc",
-        data=docx_bytes,
-        file_name=f"ot_cyber_brief_{generated.strftime('%Y-%m-%d')}.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+# ---------- Home ----------
+
+def render_home():
+    render_masthead("Banneker News Tracker", "Build your own market intel feed")
+    st.markdown(
+        f"<div style='color:{BODY_GREY}; font-size:15px; line-height:1.55; margin-bottom:24px; max-width:640px;'>"
+        "Personalized weekly news brief for your portco, your patch, or whatever you're tracking. "
+        "Takes ~4 minutes to set up. Bookmarkable URL. Optional weekly email straight to your inbox. "
+        "Built for Banneker."
+        "</div>",
+        unsafe_allow_html=True,
     )
 
-    # Themed sections — newspaper feel, iterates QUERIES.keys() to enforce order
-    for i, theme in enumerate(QUERIES.keys()):
-        items = filtered_grouped.get(theme, [])
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("Create a new tracker", type="primary", key="cta_create"):
+            st.query_params.update({"page": "create"})
+            st.rerun()
+
+    configs = load_all_configs()
+    if configs:
+        st.markdown(
+            f"<div style='margin-top:36px;'><h3 style='color:{NAVY}; margin-bottom:8px;'>Existing trackers</h3></div>",
+            unsafe_allow_html=True,
+        )
+        for tid, cfg in sorted(configs.items(), key=lambda kv: kv[1].get("created_at", "")):
+            name = cfg.get("name") or tid
+            subtitle = cfg.get("subtitle", "")
+            theme_count = len(cfg.get("themes", []))
+            url = f"?id={tid}"
+            st.markdown(
+                f"<div style='margin:10px 0; padding:14px 18px; background:{ICE_BLUE}; border-left:4px solid {NAVY}; border-radius:2px;'>"
+                f"<div style='color:{NAVY}; font-weight:700; font-size:16px;'><a href='{url}'>{name}</a></div>"
+                f"<div style='color:{DARK_GREY}; font-size:12px; margin-top:2px;'>{subtitle} &middot; {theme_count} themes</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    render_footer()
+
+
+# ---------- Create ----------
+
+def _init_form_state(template_name: str | None = None, existing_config: dict | None = None):
+    if existing_config:
+        st.session_state["form_themes"] = existing_config.get("themes", [])
+        st.session_state["form_name"] = existing_config.get("name", "")
+        st.session_state["form_subtitle"] = existing_config.get("subtitle", "")
+        st.session_state["form_title"] = existing_config.get("title", "")
+        st.session_state["form_lookback"] = existing_config.get("lookback_days", 7)
+        st.session_state["form_show_top_news"] = existing_config.get("show_top_news", True)
+        st.session_state["form_show_download"] = existing_config.get("show_download", True)
+        return
+    if template_name:
+        tmpl = get_template(template_name)
+        st.session_state["form_themes"] = [
+            {"name": t["name"], "queries": list(t["queries"])} for t in tmpl["themes"]
+        ]
+    else:
+        st.session_state.setdefault("form_themes", [{"name": "", "queries": []}])
+    st.session_state.setdefault("form_name", "")
+    st.session_state.setdefault("form_subtitle", "Banneker Partners · Market Intel")
+    st.session_state.setdefault("form_title", "")
+    st.session_state.setdefault("form_lookback", 7)
+    st.session_state.setdefault("form_show_top_news", True)
+    st.session_state.setdefault("form_show_download", True)
+
+
+def render_create(edit_id: str | None = None):
+    existing = get_config(edit_id) if edit_id else None
+    title_text = "Edit tracker" if existing else "Create your tracker"
+    render_masthead(title_text)
+
+    # Initialize form state
+    if "form_themes" not in st.session_state:
+        if existing:
+            _init_form_state(existing_config=existing)
+        else:
+            _init_form_state(template_name="Cybersecurity portco")
+
+    # Template picker (only on create, not edit)
+    if not existing:
+        st.markdown(
+            f"<div style='color:{BODY_GREY}; font-size:14px; margin-bottom:8px;'>"
+            "Pick a starter template, then edit themes and queries to fit your portco."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        template_names = get_template_names()
+        chosen = st.selectbox(
+            "Starter template",
+            options=template_names,
+            index=0,
+            help="Loads pre-filled themes and queries. You'll edit them next.",
+            key="template_picker",
+        )
+        if st.button("Load template", key="load_tmpl"):
+            _init_form_state(template_name=chosen)
+            st.rerun()
+        st.markdown(
+            f"<div style='color:{MID_GREY}; font-size:12px; font-style:italic; margin-bottom:24px;'>"
+            f"{TEMPLATES.get(chosen, {}).get('description', '')}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("---")
+
+    # Basics
+    st.markdown(f"<h3 style='color:{NAVY}; margin-bottom:8px;'>Basics</h3>", unsafe_allow_html=True)
+    name = st.text_input(
+        "Tracker name *",
+        value=st.session_state.get("form_name", ""),
+        placeholder="e.g., Industrial Defender weekly brief",
+        key="form_name",
+    )
+    title_field = st.text_input(
+        "Brief title (shown at top of the brief)",
+        value=st.session_state.get("form_title", ""),
+        placeholder="Defaults to '[Tracker Name] Brief'",
+        key="form_title",
+    )
+    subtitle = st.text_input(
+        "Subtitle / tagline",
+        value=st.session_state.get("form_subtitle", ""),
+        placeholder="e.g., Banneker Partners · OT cybersecurity market intel",
+        key="form_subtitle",
+    )
+
+    cols = st.columns(3)
+    with cols[0]:
+        lookback = st.selectbox(
+            "Lookback window",
+            options=[3, 7, 14, 30],
+            index=[3, 7, 14, 30].index(st.session_state.get("form_lookback", 7)),
+            format_func=lambda d: f"Past {d} days",
+            key="form_lookback",
+        )
+    with cols[1]:
+        show_top = st.checkbox(
+            "Show top-news card",
+            value=st.session_state.get("form_show_top_news", True),
+            key="form_show_top_news",
+        )
+    with cols[2]:
+        show_dl = st.checkbox(
+            "Show Word download",
+            value=st.session_state.get("form_show_download", True),
+            key="form_show_download",
+        )
+
+    # Themes editor
+    st.markdown(f"<h3 style='color:{NAVY}; margin-top:32px; margin-bottom:8px;'>Themes &amp; queries</h3>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='color:{BODY_GREY}; font-size:13px; margin-bottom:16px;'>"
+        "Each theme becomes a section in your brief. Queries within a theme are run against Google News "
+        "RSS. Be specific (e.g., 'NIS2 directive', not 'cybersecurity rules'). 3-10 queries per theme works "
+        "well; more queries = wider coverage but slower scrape."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    themes = st.session_state["form_themes"]
+    new_themes = []
+    for i, theme in enumerate(themes):
+        with st.container():
+            st.markdown(
+                f"<div style='background:{ICE_BLUE}; padding:14px 16px; border-radius:4px; margin-bottom:6px; border-left:4px solid {NAVY};'>"
+                f"<div style='color:{NAVY}; font-weight:700; font-size:12px; letter-spacing:1.2px; text-transform:uppercase;'>Theme {i+1:02d}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            theme_name = st.text_input(
+                f"Theme name",
+                value=theme.get("name", ""),
+                placeholder="e.g., Breaches & incidents",
+                key=f"theme_name_{i}",
+            )
+            queries_text = "\n".join(theme.get("queries", []))
+            queries_input = st.text_area(
+                f"Queries (one per line)",
+                value=queries_text,
+                placeholder="e.g.\nNIS2 directive\nCyber Resilience Act\nDORA cybersecurity",
+                key=f"theme_queries_{i}",
+                height=120,
+            )
+            cols = st.columns([1, 1, 6])
+            with cols[0]:
+                if st.button("↑", key=f"up_{i}", help="Move up", disabled=(i == 0)):
+                    themes[i], themes[i-1] = themes[i-1], themes[i]
+                    st.session_state["form_themes"] = themes
+                    st.rerun()
+            with cols[1]:
+                if st.button("↓", key=f"down_{i}", help="Move down", disabled=(i == len(themes) - 1)):
+                    themes[i], themes[i+1] = themes[i+1], themes[i]
+                    st.session_state["form_themes"] = themes
+                    st.rerun()
+            with cols[2]:
+                if st.button("Remove this theme", key=f"del_{i}"):
+                    themes.pop(i)
+                    st.session_state["form_themes"] = themes
+                    st.rerun()
+
+            new_themes.append({
+                "name": theme_name.strip(),
+                "queries": [q.strip() for q in queries_input.split("\n") if q.strip()],
+            })
+
+    if st.button("+ Add another theme", key="add_theme"):
+        themes.append({"name": "", "queries": []})
+        st.session_state["form_themes"] = themes
+        st.rerun()
+
+    # Save
+    st.markdown("---")
+    if st.button("Save tracker" if not existing else "Update tracker", type="primary", key="save_tracker"):
+        if not name.strip():
+            st.error("Tracker name is required.")
+            return
+        valid_themes = [t for t in new_themes if t["name"] and t["queries"]]
+        if not valid_themes:
+            st.error("Add at least one theme with at least one query.")
+            return
+
+        tracker_id = edit_id or make_tracker_id(name)
+        config = {
+            "id": tracker_id,
+            "name": name.strip(),
+            "title": title_field.strip() or f"{name.strip()} Brief",
+            "subtitle": subtitle.strip(),
+            "themes": valid_themes,
+            "lookback_days": int(lookback),
+            "show_top_news": bool(show_top),
+            "show_download": bool(show_dl),
+            "created_at": (existing or {}).get("created_at") or datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "email_subscription": (existing or {}).get("email_subscription"),
+        }
+        try:
+            upsert_config(tracker_id, config)
+        except Exception as e:
+            st.error(f"Failed to save: {e}")
+            return
+
+        # Clear form state
+        for k in [
+            "form_themes", "form_name", "form_subtitle", "form_title",
+            "form_lookback", "form_show_top_news", "form_show_download",
+        ]:
+            st.session_state.pop(k, None)
+
+        st.success("Saved. Redirecting to your tracker...")
+        st.query_params.clear()
+        st.query_params.update({"id": tracker_id})
+        st.rerun()
+
+    render_footer()
+
+
+# ---------- View ----------
+
+def render_view(tracker_id: str):
+    config = get_config(tracker_id)
+    if not config:
+        st.error(f"Tracker '{tracker_id}' not found.")
+        if st.button("← Back to home"):
+            st.query_params.clear()
+            st.rerun()
+        return
+
+    title = config.get("title") or f"{config.get('name', 'News')} Brief"
+    subtitle = config.get("subtitle", "")
+
+    render_masthead(title, subtitle)
+
+    st.markdown(
+        f"<div style='color:{BODY_GREY}; font-size:14px; line-height:1.5; margin-bottom:20px; max-width:640px;'>"
+        f"Click the button to pull the last {config.get('lookback_days', 7)} days of news across "
+        f"{len(config.get('themes', []))} themes. Fresh every click."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Top action row
+    cols = st.columns([3, 1, 1, 1])
+    with cols[0]:
+        go = st.button("Generate this week's brief", type="primary", key="generate")
+    with cols[1]:
+        if st.button("Edit", key="edit_btn"):
+            st.query_params.clear()
+            st.query_params.update({"page": "create", "id": tracker_id})
+            st.rerun()
+    with cols[2]:
+        if st.button("Email me", key="email_btn"):
+            st.session_state["show_email_form"] = True
+    with cols[3]:
+        if st.button("← Home", key="home_btn"):
+            st.query_params.clear()
+            st.rerun()
+
+    # Cache-bust on config change
+    cfg_hash = config_hash(config)
+    cache_key = f"results_{tracker_id}_{cfg_hash}"
+    if st.session_state.get("last_cache_key") != cache_key:
+        for k in list(st.session_state.keys()):
+            if k.startswith("results_") or k == "has_results":
+                del st.session_state[k]
+        st.session_state["last_cache_key"] = cache_key
+
+    # Email subscribe form
+    if st.session_state.get("show_email_form"):
+        with st.container():
+            st.markdown(
+                f"<div style='margin-top:16px; padding:18px; background:{ICE_BLUE}; border-radius:4px; border-left:4px solid {NAVY};'>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='color:{NAVY}; font-weight:700; font-size:14px; margin-bottom:8px;'>Email subscription</div>",
+                unsafe_allow_html=True,
+            )
+            existing_sub = config.get("email_subscription") or {}
+            email = st.text_input(
+                "Your email",
+                value=existing_sub.get("email", ""),
+                placeholder="you@banneker.com",
+                key="sub_email",
+            )
+            freq = st.selectbox(
+                "Frequency",
+                options=["weekly_monday", "weekly_friday", "daily"],
+                index=["weekly_monday", "weekly_friday", "daily"].index(
+                    existing_sub.get("frequency", "weekly_monday")
+                ),
+                format_func=lambda v: {
+                    "weekly_monday": "Weekly · Monday morning",
+                    "weekly_friday": "Weekly · Friday morning",
+                    "daily": "Daily · 6am UTC",
+                }[v],
+                key="sub_freq",
+            )
+            cols = st.columns([1, 1, 4])
+            with cols[0]:
+                if st.button("Save", key="save_sub"):
+                    if not email.strip():
+                        st.error("Email required.")
+                    else:
+                        config["email_subscription"] = {
+                            "email": email.strip(),
+                            "frequency": freq,
+                            "last_sent": None,
+                        }
+                        upsert_config(tracker_id, config)
+                        st.session_state["show_email_form"] = False
+                        st.success(f"Subscribed. First email lands per the frequency selected.")
+                        st.rerun()
+            with cols[1]:
+                if existing_sub and st.button("Unsubscribe", key="unsub"):
+                    config["email_subscription"] = None
+                    upsert_config(tracker_id, config)
+                    st.session_state["show_email_form"] = False
+                    st.success("Unsubscribed.")
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # Generate / show results
+    if go or st.session_state.get(f"has_results_{tracker_id}"):
+        if go or cache_key not in st.session_state:
+            with st.spinner("Pulling stories from Google News..."):
+                grouped, total = scrape_for_config(config)
+            st.session_state[cache_key] = (grouped, total)
+            st.session_state[f"has_results_{tracker_id}"] = True
+            st.session_state[f"generated_at_{tracker_id}"] = datetime.now()
+        else:
+            grouped, total = st.session_state[cache_key]
+
+        generated = st.session_state[f"generated_at_{tracker_id}"]
+        theme_order = [t["name"] for t in config["themes"] if t.get("name")]
+
+        # Date callout
         st.markdown(
             f"""
-            <div style='margin: 36px 0 14px 0;'>
-                <div style='color: {PERIWINKLE}; font-size: 11px; font-weight: 700; letter-spacing: 1.8px; text-transform: uppercase; margin-bottom: 2px;'>
-                    Section {i+1:02d}
-                </div>
-                <h2 style='color: {NAVY}; font-weight: 800; font-size: 22px; margin: 0 0 4px 0; line-height: 1.2;'>
-                    {theme}
-                </h2>
-                <div style='height: 2px; background: {NAVY}; width: 48px; margin-top: 8px;'></div>
+            <div style='margin-top:24px; padding:18px 22px; background:{ICE_BLUE}; border-left:5px solid {NAVY}; border-radius:2px;'>
+              <div style='color:{NAVY}; font-weight:800; font-size:22px; line-height:1.1; margin-bottom:4px;'>{generated.strftime('%B %d, %Y')}</div>
+              <div style='color:{DARK_GREY}; font-size:12px; letter-spacing:0.5px; text-transform:uppercase; font-weight:600;'>
+                Past {config.get('lookback_days', 7)} days &middot; {total} stories &middot; {len(theme_order)} themes &middot; Source: Google News RSS
+              </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        if not items:
+
+        # Top news card
+        if config.get("show_top_news", True):
+            top_picks = pick_top_stories(grouped, theme_order, n=4, lookback_days=config.get("lookback_days", 7))
+            if top_picks:
+                rows = []
+                for i, (it, theme) in enumerate(top_picks, start=1):
+                    date = it["published"].strftime("%b %d")
+                    theme_short = theme.split(" (")[0]
+                    src = (
+                        f"<span style='color:rgba(255,255,255,0.6); font-style:italic; font-size:12px;'> &mdash; {it['source']}</span>"
+                        if it["source"] else ""
+                    )
+                    rows.append(
+                        f"<div style='margin-bottom:14px; line-height:1.5;'>"
+                        f"<span style='color:{PERIWINKLE}; font-weight:800; font-size:13px; margin-right:8px;'>{i:02d}</span>"
+                        f"<span style='color:rgba(255,255,255,0.6); font-size:11px; letter-spacing:0.8px; text-transform:uppercase; font-weight:600;'>{theme_short} &middot; {date}</span><br>"
+                        f"<a href='{it['link']}' target='_blank' style='font-size:15.5px;'>{it['title']}</a>"
+                        f"{src}"
+                        f"</div>"
+                    )
+                st.markdown(
+                    f"""
+                    <div class='top-news-card' style='margin-top:22px; padding:22px 26px; background:{NAVY}; border-radius:4px;'>
+                      <div style='color:{PERIWINKLE}; font-size:11px; letter-spacing:1.8px; text-transform:uppercase; font-weight:700; margin-bottom:14px;'>This week's top news</div>
+                      {''.join(rows)}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        # Download button
+        if config.get("show_download", True):
+            docx_bytes = build_docx_bytes(grouped, theme_order, total, config)
+            st.download_button(
+                label="Download as Word doc",
+                data=docx_bytes,
+                file_name=f"{tracker_id}_{generated.strftime('%Y-%m-%d')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+        # Themed sections
+        for i, theme in enumerate(theme_order):
+            items = grouped.get(theme, [])
             st.markdown(
-                f"<div style='color: {MID_GREY}; font-style: italic; font-size: 13px; margin: 8px 0;'>No news in the lookback window.</div>",
+                f"""
+                <div style='margin:36px 0 14px 0;'>
+                  <div style='color:{PERIWINKLE}; font-size:11px; font-weight:700; letter-spacing:1.8px; text-transform:uppercase; margin-bottom:2px;'>Section {i+1:02d}</div>
+                  <h2 style='color:{NAVY}; font-weight:800; font-size:22px; margin:0 0 4px 0; line-height:1.2;'>{theme}</h2>
+                  <div style='height:2px; background:{NAVY}; width:48px; margin-top:8px;'></div>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
-            continue
-        story_rows = []
-        for it in items:
-            date = it["published"].strftime("%b %d")
-            src = (
-                f" <span style='color: {MID_GREY}; font-style: italic; font-size: 12px;'>&mdash; {it['source']}</span>"
-                if it["source"] else ""
-            )
-            story_rows.append(
-                f"<div style='margin-bottom: 10px; line-height: 1.45; color: #3A3A3C; font-size: 14.5px;'>"
-                f"<span style='display: inline-block; min-width: 56px; color: {NAVY}; font-weight: 700; font-size: 13px;'>{date}</span>"
-                f"<a href='{it['link']}' target='_blank' style='color: {NAVY};'>{it['title']}</a>"
-                f"{src}"
-                f"</div>"
-            )
-        st.markdown("".join(story_rows), unsafe_allow_html=True)
+            if not items:
+                st.markdown(
+                    f"<div style='color:{MID_GREY}; font-style:italic; font-size:13px; margin:8px 0;'>No news in the lookback window.</div>",
+                    unsafe_allow_html=True,
+                )
+                continue
+            story_rows = []
+            for it in items:
+                date = it["published"].strftime("%b %d")
+                src = (
+                    f" <span style='color:{MID_GREY}; font-style:italic; font-size:12px;'>&mdash; {it['source']}</span>"
+                    if it["source"] else ""
+                )
+                story_rows.append(
+                    f"<div style='margin-bottom:10px; line-height:1.45; color:{BODY_GREY}; font-size:14.5px;'>"
+                    f"<span style='display:inline-block; min-width:56px; color:{NAVY}; font-weight:700; font-size:13px;'>{date}</span>"
+                    f"<a href='{it['link']}' target='_blank' style='color:{NAVY};'>{it['title']}</a>"
+                    f"{src}"
+                    f"</div>"
+                )
+            st.markdown("".join(story_rows), unsafe_allow_html=True)
 
-# Footer
-st.markdown(
-    f"""
-    <div style='margin-top: 56px; padding-top: 16px; border-top: 1px solid {ICE_BLUE};'>
-        <div style='color: {MID_GREY}; font-size: 11px; letter-spacing: 0.3px;'>
-            (C) {datetime.now().year} Banneker Partners, LLC. All Rights Reserved. Confidential.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    render_footer()
+
+
+# ---------- Router ----------
+
+params = st.query_params
+page = params.get("page", "")
+tracker_id = params.get("id", "")
+edit_mode = params.get("edit", "") == "1" or (page == "create" and tracker_id)
+
+if page == "create":
+    render_create(edit_id=tracker_id if edit_mode else None)
+elif tracker_id:
+    render_view(tracker_id)
+else:
+    render_home()

@@ -1,25 +1,28 @@
-# OT Cybersecurity Weekly Brief
+# Banneker News Tracker
 
-A web app that pulls OT cybersecurity news from the past 7 days across themed queries (EU regulation, NERC-CIP / TSA / CISA, ICS security, breaches, competitive landscape) and renders a clean, Banneker-branded weekly brief.
+Multi-tenant Streamlit app where any Banneker coworker can spin up a personalized news brief for their portco, deal, or vertical in ~4 minutes. Optional weekly/daily email delivery.
 
-Built for Industrial Defender market intel — designed so a non-technical user can open the URL, click a button, and read the brief.
+Built on Google News RSS + Banneker visual style. All free to operate.
 
-## How it works
+## Architecture
 
-- Hits Google News RSS across ~50 themed queries
-- Filters to last 7 days, dedupes by URL and title
-- Renders themed sections with hyperlinked stories
-- Optional Word doc download
+- **app.py** — Streamlit UI (home / create / view routing via query params)
+- **core.py** — scraping, news filter, ranking, DOCX export, email HTML builder
+- **storage.py** — GitHub Gist as the config store (`trackers.json` file)
+- **templates.py** — starter templates per portco type
+- **email_sender.py** — Resend API wrapper
+- **scripts/send_emails.py** — daily cron worker (run by GitHub Actions)
+- **.github/workflows/send_emails.yml** — schedule
 
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
+# Create .streamlit/secrets.toml with GITHUB_GIST_ID, GITHUB_PAT,
+# RESEND_API_KEY, RESEND_FROM
 streamlit run app.py
 ```
 
-Then open the URL Streamlit prints (usually `http://localhost:8501`).
-
 ## Deploy
 
-See `DEPLOY.md` for step-by-step Streamlit Community Cloud deployment.
+See [DEPLOY.md](DEPLOY.md). Setup takes ~25 minutes one-time.
